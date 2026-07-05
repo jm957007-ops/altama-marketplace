@@ -476,7 +476,7 @@ export default function MarketplaceZonaConurbada() {
       <header style={styles.header}>
         <div style={styles.headerTop}>
           <div>
-            <div style={styles.eyebrow}>ALTAMA MARKETPLACE</div>
+            <div style={styles.eyebrow}>libremercadoventas.com</div>
             <h1 style={styles.title}>Altama · Tampico, Madero y Altamira</h1>
           </div>
           <button style={styles.cartBtn} onClick={() => setCartOpen(true)}>
@@ -1039,7 +1039,7 @@ const styles = {
   },
   eyebrow: {
     fontSize: 11,
-    letterSpacing: "0.14em",
+    letterSpacing: "0.02em",
     color: GOLD,
     fontWeight: 700,
     marginBottom: 4,
@@ -1610,4 +1610,5 @@ const styles = {
     borderRadius: 999,
   },
 };
+
 
