@@ -1,8 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
-import { doc, onSnapshot, setDoc } from "firebase/firestore";
-import { db } from "./firebase";
 
-const DOC_REF_PATH = ["altama", "marketplace"]; // colección "altama", documento "marketplace"
+const STORAGE_KEY = "marketplace-zc-data";
 const ME_KEY = "marketplace-zc-mi-identidad";
 const CART_KEY = "marketplace-zc-carrito";
 const ADMIN_PASSWORD = "zonaconurbada2026";
@@ -105,61 +103,59 @@ export default function MarketplaceZonaConurbada() {
 
   // admin
   const [showAdminLogin, setShowAdminLogin] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const showToast = useCallback((mensaje) => {
+    setToast(mensaje);
+    window.clearTimeout(showToast._t);
+    showToast._t = window.setTimeout(() => setToast(null), 2600);
+  }, []);
   const [adminInput, setAdminInput] = useState("");
   const [adminError, setAdminError] = useState("");
 
-  const docRef = doc(db, ...DOC_REF_PATH);
-
   useEffect(() => {
-    try {
-      const me = localStorage.getItem(ME_KEY);
-      if (me) setIdentidad(JSON.parse(me));
-    } catch (e) {}
-    try {
-      const cart = localStorage.getItem(CART_KEY);
-      if (cart) setCarrito(JSON.parse(cart));
-    } catch (e) {}
-
-    const unsub = onSnapshot(
-      docRef,
-      (snap) => {
-        if (snap.exists()) {
-          const data = snap.data();
-          setVendedores(data.vendedores || []);
-          setProductos(data.productos || []);
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, true);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          setVendedores(parsed.vendedores || []);
+          setProductos(parsed.productos || []);
         }
-        setLoaded(true);
-      },
-      (err) => {
-        console.error(err);
-        setError("No se pudo conectar con la base de datos. Revisa tu configuración de Firebase.");
-        setLoaded(true);
-      }
-    );
-    return () => unsub();
+      } catch (e) {}
+      try {
+        const meRes = await window.storage.get(ME_KEY, false);
+        if (meRes && meRes.value) setIdentidad(JSON.parse(meRes.value));
+      } catch (e) {}
+      try {
+        const cartRes = await window.storage.get(CART_KEY, false);
+        if (cartRes && cartRes.value) setCarrito(JSON.parse(cartRes.value));
+      } catch (e) {}
+      setLoaded(true);
+    })();
   }, []);
 
   const persist = useCallback(async (nextVendedores, nextProductos) => {
     setSaving(true);
     try {
-      await setDoc(docRef, { vendedores: nextVendedores, productos: nextProductos });
+      await window.storage.set(STORAGE_KEY, JSON.stringify({ vendedores: nextVendedores, productos: nextProductos }), true);
     } catch (e) {
       setError("No se pudo guardar. Intenta de nuevo.");
     }
     setSaving(false);
   }, []);
 
-  const persistIdentidad = useCallback((next) => {
+  const persistIdentidad = useCallback(async (next) => {
     setIdentidad(next);
     try {
-      localStorage.setItem(ME_KEY, JSON.stringify(next));
+      await window.storage.set(ME_KEY, JSON.stringify(next), false);
     } catch (e) {}
   }, []);
 
-  const persistCarrito = useCallback((next) => {
+  const persistCarrito = useCallback(async (next) => {
     setCarrito(next);
     try {
-      localStorage.setItem(CART_KEY, JSON.stringify(next));
+      await window.storage.set(CART_KEY, JSON.stringify(next), false);
     } catch (e) {}
   }, []);
 
@@ -250,11 +246,13 @@ export default function MarketplaceZonaConurbada() {
     setShowRegistroVendedor(false);
     setError("");
     setTab("vender");
+    showToast(`✓ Tienda creada — sesión iniciada como ${nombre}`);
   }
 
   function cerrarSesionVendedor() {
     persistIdentidad({ tipo: "comprador" });
     setTab("comprar");
+    showToast("Sesión de vendedor cerrada");
   }
 
   // ---- productos ----
@@ -405,9 +403,16 @@ export default function MarketplaceZonaConurbada() {
       setAdminInput("");
       setAdminError("");
       setTab("admin");
+      showToast("🔑 Sesión de administrador iniciada");
     } else {
       setAdminError("Contraseña incorrecta.");
     }
+  }
+
+  function adminLogout() {
+    persistIdentidad({ tipo: "comprador" });
+    setTab("comprar");
+    showToast("Sesión de administrador cerrada");
   }
 
   function adminEliminarVendedor(vendedorId) {
@@ -460,7 +465,13 @@ export default function MarketplaceZonaConurbada() {
           from { transform: translate(-50%, 20px); opacity: 0; }
           to { transform: translate(-50%, 0); opacity: 1; }
         }
+        @keyframes toastIn {
+          from { transform: translate(-50%, -12px); opacity: 0; }
+          to { transform: translate(-50%, 0); opacity: 1; }
+        }
       `}</style>
+
+      {toast && <div style={styles.toast}>{toast}</div>}
 
       <header style={styles.header}>
         <div style={styles.headerTop}>
@@ -640,6 +651,10 @@ export default function MarketplaceZonaConurbada() {
       {/* ---------- TAB ADMIN ---------- */}
       {tab === "admin" && identidad.tipo === "admin" && (
         <section>
+          <div style={styles.adminPanelHeader}>
+            <span style={styles.adminPanelBadge}>🔑 Sesión de administrador activa</span>
+            <button onClick={adminLogout} style={styles.logoutBtn}>Salir</button>
+          </div>
           <h2 style={styles.sectionTitle}>Vendedores ({vendedores.length})</h2>
           <div style={styles.productTable}>
             {vendedores.map((v) => {
@@ -991,6 +1006,22 @@ const styles = {
     color: DIM,
     fontFamily: "'Inter', sans-serif",
   },
+  toast: {
+    position: "fixed",
+    top: 16,
+    left: "50%",
+    transform: "translateX(-50%)",
+    background: INK,
+    color: "#fff",
+    padding: "10px 20px",
+    borderRadius: 999,
+    fontSize: 13,
+    fontWeight: 700,
+    zIndex: 200,
+    boxShadow: "0 8px 24px rgba(0,0,0,0.25)",
+    animation: "toastIn 0.2s ease-out",
+    whiteSpace: "nowrap",
+  },
   header: {
     background: "#fff",
     borderBottom: `1px solid ${BORDER}`,
@@ -1189,6 +1220,22 @@ const styles = {
     maxWidth: 1100,
     margin: "0 auto 12px",
     padding: "0 20px",
+  },
+  adminPanelHeader: {
+    maxWidth: 1100,
+    margin: "20px auto 16px",
+    padding: "0 20px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  adminPanelBadge: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: GREEN,
+    background: "#E4F5F3",
+    padding: "6px 12px",
+    borderRadius: 999,
   },
   vendedorHeader: {
     maxWidth: 1100,
@@ -1563,3 +1610,4 @@ const styles = {
     borderRadius: 999,
   },
 };
+
