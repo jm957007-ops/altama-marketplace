@@ -1,6 +1,7 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { db } from "./firebase";
+import { collection, doc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
 
-const STORAGE_KEY = "marketplace-zc-data";
 const ME_KEY = "marketplace-zc-mi-identidad";
 const CART_KEY = "marketplace-zc-carrito";
 const ADMIN_PASSWORD = "zonaconurbada2026";
@@ -31,9 +32,9 @@ const CIUDADES = ["Tampico", "Ciudad Madero", "Altamira"];
 const CATEGORIAS = ["Electrónica", "Hogar", "Moda", "Vehículos", "Servicios", "Otros"];
 
 const GREEN = "#1FA6A0"; // turquesa costero — color principal de marca
-const GOLD = "#E2603F"; // coral — acentos de energía (eyebrow, destacados)
+const GOLD = "#E2603F"; // coral — acentos de energía
 const RED = "#C24444";
-const INK = "#123A3D"; // tinta con matiz petróleo, coherente con el turquesa
+const INK = "#123A3D"; // tinta petróleo
 const DIM = "#6B8482";
 const BORDER = "#DCEAE8";
 const BG = "#F6EFE3"; // arena cálida
@@ -85,7 +86,10 @@ export default function MarketplaceZonaConurbada() {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [cartOpen, setCartOpen] = useState(false);
-  const [entregaPorVendedor, setEntregaPorVendedor] = useState({}); // { [vendedorId]: 'domicilio' | 'recoger' }
+  const [entregaPorVendedor, setEntregaPorVendedor] = useState({});
+
+  // ids presentes en Firestore, para saber qué borrar al sincronizar
+  const idsFirestore = useRef({ vendedores: new Set(), productos: new Set() });
 
   // filtros comprador
   const [busqueda, setBusqueda] = useState("");
@@ -97,48 +101,72 @@ export default function MarketplaceZonaConurbada() {
   const [nuevoVendedor, setNuevoVendedor] = useState({ nombre: "", whatsapp: "", ciudad: CIUDADES[0] });
 
   // form producto
-  const [productoForm, setProductoForm] = useState(null); // null = cerrado, {} nuevo, {...} editar
+  const [productoForm, setProductoForm] = useState(null);
   const [subiendoImagen, setSubiendoImagen] = useState(false);
-  const [lightbox, setLightbox] = useState(null); // { imagenes: [], index: 0 }
+  const [lightbox, setLightbox] = useState(null);
 
   // admin
   const [showAdminLogin, setShowAdminLogin] = useState(false);
   const [toast, setToast] = useState(null);
+  const [adminInput, setAdminInput] = useState("");
+  const [adminError, setAdminError] = useState("");
 
   const showToast = useCallback((mensaje) => {
     setToast(mensaje);
     window.clearTimeout(showToast._t);
     showToast._t = window.setTimeout(() => setToast(null), 2600);
   }, []);
-  const [adminInput, setAdminInput] = useState("");
-  const [adminError, setAdminError] = useState("");
 
+  // ---- Carga en tiempo real desde Firestore ----
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await window.storage.get(STORAGE_KEY, true);
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          setVendedores(parsed.vendedores || []);
-          setProductos(parsed.productos || []);
-        }
-      } catch (e) {}
-      try {
-        const meRes = await window.storage.get(ME_KEY, false);
-        if (meRes && meRes.value) setIdentidad(JSON.parse(meRes.value));
-      } catch (e) {}
-      try {
-        const cartRes = await window.storage.get(CART_KEY, false);
-        if (cartRes && cartRes.value) setCarrito(JSON.parse(cartRes.value));
-      } catch (e) {}
-      setLoaded(true);
-    })();
+    const unsubV = onSnapshot(
+      collection(db, "altama_vendedores"),
+      (snap) => {
+        idsFirestore.current.vendedores = new Set(snap.docs.map((d) => d.id));
+        setVendedores(snap.docs.map((d) => d.data()));
+      },
+      () => setError("No se pudo conectar a la base de datos.")
+    );
+    const unsubP = onSnapshot(
+      collection(db, "altama_productos"),
+      (snap) => {
+        idsFirestore.current.productos = new Set(snap.docs.map((d) => d.id));
+        setProductos(snap.docs.map((d) => d.data()));
+        setLoaded(true);
+      },
+      () => {
+        setError("No se pudo conectar a la base de datos.");
+        setLoaded(true);
+      }
+    );
+    try {
+      const me = localStorage.getItem(ME_KEY);
+      if (me) setIdentidad(JSON.parse(me));
+      const cart = localStorage.getItem(CART_KEY);
+      if (cart) setCarrito(JSON.parse(cart));
+    } catch (e) {}
+    return () => {
+      unsubV();
+      unsubP();
+    };
   }, []);
 
+  // ---- Guardar en Firestore (escribe todo y borra lo que ya no existe) ----
   const persist = useCallback(async (nextVendedores, nextProductos) => {
     setSaving(true);
     try {
-      await window.storage.set(STORAGE_KEY, JSON.stringify({ vendedores: nextVendedores, productos: nextProductos }), true);
+      const vIds = new Set(nextVendedores.map((v) => v.id));
+      const pIds = new Set(nextProductos.map((p) => p.id));
+      const ops = [];
+      nextVendedores.forEach((v) => ops.push(setDoc(doc(db, "altama_vendedores", v.id), v)));
+      nextProductos.forEach((p) => ops.push(setDoc(doc(db, "altama_productos", p.id), p)));
+      idsFirestore.current.vendedores.forEach((id) => {
+        if (!vIds.has(id)) ops.push(deleteDoc(doc(db, "altama_vendedores", id)));
+      });
+      idsFirestore.current.productos.forEach((id) => {
+        if (!pIds.has(id)) ops.push(deleteDoc(doc(db, "altama_productos", id)));
+      });
+      await Promise.all(ops);
     } catch (e) {
       setError("No se pudo guardar. Intenta de nuevo.");
     }
@@ -148,14 +176,14 @@ export default function MarketplaceZonaConurbada() {
   const persistIdentidad = useCallback(async (next) => {
     setIdentidad(next);
     try {
-      await window.storage.set(ME_KEY, JSON.stringify(next), false);
+      localStorage.setItem(ME_KEY, JSON.stringify(next));
     } catch (e) {}
   }, []);
 
   const persistCarrito = useCallback(async (next) => {
     setCarrito(next);
     try {
-      await window.storage.set(CART_KEY, JSON.stringify(next), false);
+      localStorage.setItem(CART_KEY, JSON.stringify(next));
     } catch (e) {}
   }, []);
 
@@ -209,13 +237,12 @@ export default function MarketplaceZonaConurbada() {
     return groups;
   }, [carritoDetallado]);
 
-  const carritoTotal = carritoDetallado.reduce(
-    (sum, item) => sum + item.producto.precio * item.cantidad,
-    0
-  ) + Object.keys(carritoPorVendedor).reduce(
-    (sum, vId) => sum + (entregaPorVendedor[vId] === "domicilio" ? COSTO_ENVIO : 0),
-    0
-  );
+  const carritoTotal =
+    carritoDetallado.reduce((sum, item) => sum + item.producto.precio * item.cantidad, 0) +
+    Object.keys(carritoPorVendedor).reduce(
+      (sum, vId) => sum + (entregaPorVendedor[vId] === "domicilio" ? COSTO_ENVIO : 0),
+      0
+    );
 
   function elegirEntrega(vendedorId, tipo) {
     setEntregaPorVendedor((prev) => ({ ...prev, [vendedorId]: tipo }));
@@ -236,7 +263,7 @@ export default function MarketplaceZonaConurbada() {
       whatsapp,
       ciudad: nuevoVendedor.ciudad,
       activo: true,
-      ultimoPago: hoyISO(), // primer mes de cortesía/prueba al registrarse
+      ultimoPago: hoyISO(),
       ventas: 0,
     };
     const nextVendedores = [...vendedores, vendedor];
@@ -244,6 +271,7 @@ export default function MarketplaceZonaConurbada() {
     persist(nextVendedores, productos);
     persistIdentidad({ tipo: "vendedor", vendedorId: id, nombre });
     setShowRegistroVendedor(false);
+    setNuevoVendedor({ nombre: "", whatsapp: "", ciudad: CIUDADES[0] });
     setError("");
     setTab("vender");
     showToast(`✓ Tienda creada — sesión iniciada como ${nombre}`);
@@ -305,7 +333,9 @@ export default function MarketplaceZonaConurbada() {
     }
     let nextProductos;
     if (f.id) {
-      nextProductos = productos.map((p) => (p.id === f.id ? { ...f, precio: Number(f.precio), stock: Number(f.stock) || 0 } : p));
+      nextProductos = productos.map((p) =>
+        p.id === f.id ? { ...f, precio: Number(f.precio), stock: Number(f.stock) || 0 } : p
+      );
     } else {
       const nuevo = {
         id: uid(),
@@ -325,6 +355,7 @@ export default function MarketplaceZonaConurbada() {
     persist(vendedores, nextProductos);
     setProductoForm(null);
     setError("");
+    showToast("✓ Producto guardado");
   }
 
   function eliminarProducto(id) {
@@ -350,6 +381,7 @@ export default function MarketplaceZonaConurbada() {
     setProductos(nextProductos);
     setVendedores(nextVendedores);
     persist(nextVendedores, nextProductos);
+    showToast("✓ Venta registrada");
   }
 
   // ---- carrito ----
@@ -357,7 +389,9 @@ export default function MarketplaceZonaConurbada() {
     const existing = carrito.find((c) => c.productoId === producto.id);
     let next;
     if (existing) {
-      next = carrito.map((c) => (c.productoId === producto.id ? { ...c, cantidad: c.cantidad + 1 } : c));
+      next = carrito.map((c) =>
+        c.productoId === producto.id ? { ...c, cantidad: c.cantidad + 1 } : c
+      );
     } else {
       next = [...carrito, { productoId: producto.id, cantidad: 1 }];
     }
@@ -391,7 +425,7 @@ export default function MarketplaceZonaConurbada() {
       tipoEntrega === "domicilio"
         ? `🚚 Envío a domicilio (+${money(COSTO_ENVIO)})`
         : `🏠 Recoger en tienda (gratis)`;
-    const mensaje = `Hola ${vendedor.nombre}, quiero pedir:\n\n${lineas.join("\n")}\n\nEntrega: ${entregaTexto}\nSubtotal: ${money(subtotal)}\nTotal: ${money(total)}\n\n(Pedido desde Altama Marketplace)`;
+    const mensaje = `Hola ${vendedor.nombre}, quiero pedir:\n\n${lineas.join("\n")}\n\nEntrega: ${entregaTexto}\nSubtotal: ${money(subtotal)}\nTotal: ${money(total)}\n\n(Pedido desde Libre Mercado Ventas)`;
     window.open(waLink(vendedor.whatsapp, mensaje), "_blank");
   }
 
@@ -429,18 +463,13 @@ export default function MarketplaceZonaConurbada() {
     );
     setVendedores(next);
     persist(next, productos);
+    showToast("✓ Pago registrado (+30 días)");
   }
 
   function adminToggleActivoVendedor(vendedorId) {
-    const next = vendedores.map((v) =>
-      v.id === vendedorId ? { ...v, activo: !v.activo } : v
-    );
+    const next = vendedores.map((v) => (v.id === vendedorId ? { ...v, activo: !v.activo } : v));
     setVendedores(next);
     persist(next, productos);
-  }
-
-  function adminEliminarProducto(id) {
-    eliminarProducto(id);
   }
 
   if (!loaded) {
@@ -462,8 +491,8 @@ export default function MarketplaceZonaConurbada() {
         .prod-card:hover { box-shadow: 0 6px 20px rgba(20,30,50,0.10); transform: translateY(-2px); }
         ::placeholder { color: #A69C8A; }
         @keyframes floatCartIn {
-          from { transform: translate(-50%, 20px); opacity: 0; }
-          to { transform: translate(-50%, 0); opacity: 1; }
+          from { transform: translateX(30px); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
         }
         @keyframes toastIn {
           from { transform: translate(-50%, -12px); opacity: 0; }
@@ -472,12 +501,13 @@ export default function MarketplaceZonaConurbada() {
       `}</style>
 
       {toast && <div style={styles.toast}>{toast}</div>}
+      {saving && <div style={styles.savingBadge}>Guardando…</div>}
 
       <header style={styles.header}>
         <div style={styles.headerTop}>
           <div>
             <div style={styles.eyebrow}>libremercadoventas.com</div>
-            <h1 style={styles.title}>Altama · Tampico, Madero y Altamira</h1>
+            <h1 style={styles.title}>Libre Mercado Ventas · Tampico, Madero y Altamira</h1>
           </div>
           <button style={styles.cartBtn} onClick={() => setCartOpen(true)}>
             🛒 {cartCount > 0 && <span style={styles.cartBadge}>{cartCount}</span>}
@@ -512,7 +542,11 @@ export default function MarketplaceZonaConurbada() {
         </nav>
       </header>
 
-      {error && <div style={styles.errorBanner}>{error}</div>}
+      {error && (
+        <div style={styles.errorBanner} onClick={() => setError("")}>
+          {error} <span style={{ opacity: 0.6, fontSize: 12 }}>(toca para cerrar)</span>
+        </div>
+      )}
 
       {/* ---------- TAB COMPRAR ---------- */}
       {tab === "comprar" && (
@@ -546,39 +580,37 @@ export default function MarketplaceZonaConurbada() {
             <div style={styles.grid}>
               {productosVisibles.map((p) => {
                 const imgs = p.imagenes || (p.imagen ? [p.imagen] : []);
+                const vendedor = vendedorById[p.vendedorId];
+                const rep = reputacion(vendedor?.ventas);
                 return (
-                <div key={p.id} className="prod-card" style={styles.card}>
-                  <div
-                    style={{ ...styles.cardImageWrap, cursor: imgs.length ? "zoom-in" : "default" }}
-                    onClick={() => imgs.length && setLightbox({ imagenes: imgs, index: 0 })}
-                  >
-                    {imgs.length ? (
-                      <>
-                        <img src={imgs[0]} alt={p.nombre} style={styles.cardImage} />
-                        {imgs.length > 1 && (
-                          <span style={styles.cardImageCount}>📷 {imgs.length}</span>
-                        )}
-                      </>
-                    ) : (
-                      <div style={styles.cardImagePlaceholder}>📦</div>
-                    )}
-                  </div>
-                  <div style={styles.cardBody}>
-                    <div style={styles.cardCategoria}>{p.categoria} · {p.ciudad}</div>
-                    <div style={styles.cardNombre}>{p.nombre}</div>
-                    <div style={styles.cardPrecio}>{money(p.precio)}</div>
-                    <div style={styles.cardVendedor}>
-                      {vendedorById[p.vendedorId]?.nombre}
-                      {(() => {
-                        const rep = reputacion(vendedorById[p.vendedorId]?.ventas);
-                        return <span style={styles.repBadgeInline}> · {rep.emoji} {rep.label}</span>;
-                      })()}
+                  <div key={p.id} className="prod-card" style={styles.card}>
+                    <div
+                      style={{ ...styles.cardImageWrap, cursor: imgs.length ? "zoom-in" : "default" }}
+                      onClick={() => imgs.length && setLightbox({ imagenes: imgs, index: 0 })}
+                    >
+                      {imgs.length ? (
+                        <>
+                          <img src={imgs[0]} alt={p.nombre} style={styles.cardImage} />
+                          {imgs.length > 1 && <span style={styles.cardImageCount}>📷 {imgs.length}</span>}
+                        </>
+                      ) : (
+                        <div style={styles.cardImagePlaceholder}>📦</div>
+                      )}
                     </div>
-                    <button style={styles.cardBtn} onClick={() => agregarAlCarrito(p)}>
-                      Agregar al carrito
-                    </button>
+                    <div style={styles.cardBody}>
+                      <div style={styles.cardCategoria}>{p.categoria} · {p.ciudad}</div>
+                      <div style={styles.cardNombre}>{p.nombre}</div>
+                      <div style={styles.cardPrecio}>{money(p.precio)}</div>
+                      {vendedor && (
+                        <div style={styles.cardVendedor}>
+                          {rep.emoji} {vendedor.nombre} · {rep.label}
+                        </div>
+                      )}
+                      <button style={styles.btnPrimario} onClick={() => agregarAlCarrito(p)}>
+                        Agregar al carrito
+                      </button>
+                    </div>
                   </div>
-                </div>
                 );
               })}
             </div>
@@ -586,63 +618,80 @@ export default function MarketplaceZonaConurbada() {
         </section>
       )}
 
-      {/* ---------- TAB VENDER ---------- */}
+      {/* ---------- TAB VENDER (MI TIENDA) ---------- */}
       {tab === "vender" && miVendedor && (
-        <section>
-          <div style={styles.vendedorHeader}>
+        <section style={styles.panel}>
+          <div style={styles.panelHeader}>
             <div>
-              <div style={styles.vendedorNombre}>{miVendedor.nombre}</div>
-              <div style={styles.vendedorMeta}>{miVendedor.ciudad} · {miVendedor.whatsapp}</div>
-              <div style={styles.vendedorRep}>
-                {(() => {
-                  const rep = reputacion(miVendedor.ventas);
-                  return `${rep.emoji} ${rep.label} · ${miVendedor.ventas || 0} venta(s)`;
-                })()}
+              <h2 style={styles.panelTitle}>🏪 {miVendedor.nombre}</h2>
+              <div style={styles.panelSub}>
+                {miVendedor.ciudad} · WhatsApp {miVendedor.whatsapp} · {reputacion(miVendedor.ventas).emoji}{" "}
+                {reputacion(miVendedor.ventas).label} ({miVendedor.ventas || 0} ventas)
               </div>
             </div>
-            <button onClick={cerrarSesionVendedor} style={styles.logoutBtn}>Cerrar sesión</button>
+            <button style={styles.btnLink} onClick={cerrarSesionVendedor}>Cerrar sesión</button>
           </div>
 
           {(() => {
             const dias = diasRestantes(miVendedor.ultimoPago);
-            const vencido = dias < 0;
+            if (dias <= 0)
+              return (
+                <div style={styles.avisoRojo}>
+                  ⚠️ Tu membresía venció. Contacta al administrador para renovar ({money(CUOTA_MENSUAL)}/mes) y
+                  mantener tus productos visibles.
+                </div>
+              );
+            if (dias <= 5)
+              return (
+                <div style={styles.avisoAmarillo}>
+                  ⏳ Tu membresía vence en {dias} día{dias === 1 ? "" : "s"}. Renueva a tiempo para no perder
+                  visibilidad.
+                </div>
+              );
             return (
-              <div style={{ ...styles.vendorPagoBanner, ...(vencido ? styles.pagoVencidoBanner : styles.pagoVigenteBanner) }}>
-                {vencido
-                  ? `⚠️ Tu cuota mensual (${money(CUOTA_MENSUAL)}) está vencida. Contacta al administrador para reactivar tu tienda.`
-                  : `✓ Tu cuota está vigente. Vence en ${dias} día(s).`}
-              </div>
+              <div style={styles.avisoVerde}>✓ Membresía activa — {dias} días restantes.</div>
             );
           })()}
 
-          <button style={styles.newProductBtn} onClick={abrirNuevoProducto}>+ Nuevo producto</button>
+          <button style={{ ...styles.btnPrimario, maxWidth: 260 }} onClick={abrirNuevoProducto}>
+            + Publicar producto
+          </button>
 
           {misProductos.length === 0 ? (
-            <div style={styles.emptyState}>Aún no has publicado productos.</div>
+            <div style={styles.emptyState}>Aún no has publicado productos. ¡Publica el primero!</div>
           ) : (
-            <div style={styles.productTable}>
-              {misProductos.map((p) => (
-                <div key={p.id} style={styles.productRow}>
-                  <div style={styles.productRowInfo}>
-                    <div style={{ ...styles.productRowNombre, ...(p.activo ? {} : styles.productRowInactivo) }}>
-                      {p.nombre}
+            <div style={styles.listado}>
+              {misProductos.map((p) => {
+                const imgs = p.imagenes || [];
+                return (
+                  <div key={p.id} style={styles.filaProducto}>
+                    <div style={styles.filaThumb}>
+                      {imgs.length ? <img src={imgs[0]} alt="" style={styles.filaThumbImg} /> : "📦"}
                     </div>
-                    <div style={styles.productRowMeta}>
-                      {p.categoria} · {money(p.precio)} · stock: {p.stock} · vendidos: {p.vendidos || 0}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={styles.filaNombre}>
+                        {p.nombre} {!p.activo && <span style={styles.tagPausado}>Pausado</span>}
+                      </div>
+                      <div style={styles.filaDetalle}>
+                        {money(p.precio)} · Stock: {p.stock || 0} · Vendidos: {p.vendidos || 0}
+                      </div>
+                    </div>
+                    <div style={styles.filaAcciones}>
+                      <button style={styles.btnMini} onClick={() => marcarVentaProducto(p)}>+1 venta</button>
+                      <button style={styles.btnMini} onClick={() => abrirEditarProducto(p)}>Editar</button>
+                      <button style={styles.btnMini} onClick={() => toggleActivoProducto(p.id)}>
+                        {p.activo ? "Pausar" : "Activar"}
+                      </button>
+                      <button
+                        style={{ ...styles.btnMini, color: RED }}
+                        onClick={() => window.confirm("¿Eliminar este producto?") && eliminarProducto(p.id)}
+                      >
+                        Eliminar
+                      </button>
                     </div>
                   </div>
-                  <div style={styles.productRowActions}>
-                    <button onClick={() => marcarVentaProducto(p)} style={styles.smallBtnVenta}>
-                      ✅ +1 venta
-                    </button>
-                    <button onClick={() => toggleActivoProducto(p.id)} style={styles.smallBtnOutline}>
-                      {p.activo ? "Pausar" : "Activar"}
-                    </button>
-                    <button onClick={() => abrirEditarProducto(p)} style={styles.smallBtnOutline}>Editar</button>
-                    <button onClick={() => eliminarProducto(p.id)} style={styles.smallBtnDanger}>Eliminar</button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </section>
@@ -650,531 +699,525 @@ export default function MarketplaceZonaConurbada() {
 
       {/* ---------- TAB ADMIN ---------- */}
       {tab === "admin" && identidad.tipo === "admin" && (
-        <section>
-          <div style={styles.adminPanelHeader}>
-            <span style={styles.adminPanelBadge}>🔑 Sesión de administrador activa</span>
-            <button onClick={adminLogout} style={styles.logoutBtn}>Salir</button>
-          </div>
-          <h2 style={styles.sectionTitle}>Vendedores ({vendedores.length})</h2>
-          <div style={styles.productTable}>
-            {vendedores.map((v) => {
-              const dias = diasRestantes(v.ultimoPago);
-              const vencido = dias < 0;
-              return (
-                <div key={v.id} style={styles.productRow}>
-                  <div style={styles.productRowInfo}>
-                    <div style={styles.productRowNombre}>
-                      {v.nombre}{" "}
-                      {v.activo === false && <span style={styles.pausadoTag}>PAUSADA</span>}
-                    </div>
-                    <div style={styles.productRowMeta}>
-                      {v.ciudad} · {v.whatsapp} · {productos.filter(p => p.vendedorId === v.id).length} productos
-                      {" · "}
-                      {(() => {
-                        const rep = reputacion(v.ventas);
-                        return `${rep.emoji} ${rep.label} (${v.ventas || 0} ventas)`;
-                      })()}
-                    </div>
-                    <div style={{ ...styles.pagoStatus, ...(vencido ? styles.pagoVencido : styles.pagoVigente) }}>
-                      {vencido
-                        ? `⚠️ Cuota vencida hace ${Math.abs(dias)} día(s)`
-                        : `✓ Cuota vigente — vence en ${dias} día(s)`}
-                    </div>
-                  </div>
-                  <div style={styles.productRowActions}>
-                    <button onClick={() => adminMarcarPago(v.id)} style={styles.smallBtnPago}>
-                      💰 Marcar pago ({money(CUOTA_MENSUAL)})
-                    </button>
-                    <button onClick={() => adminToggleActivoVendedor(v.id)} style={styles.smallBtnOutline}>
-                      {v.activo === false ? "Reactivar" : "Pausar"}
-                    </button>
-                    <button onClick={() => adminEliminarVendedor(v.id)} style={styles.smallBtnDanger}>Eliminar</button>
-                  </div>
-                </div>
-              );
-            })}
+        <section style={styles.panel}>
+          <div style={styles.panelHeader}>
+            <h2 style={styles.panelTitle}>🔑 Panel de administración</h2>
+            <button style={styles.btnLink} onClick={adminLogout}>Salir</button>
           </div>
 
-          <h2 style={{ ...styles.sectionTitle, marginTop: 28 }}>Todos los productos ({productos.length})</h2>
-          <div style={styles.productTable}>
-            {productos.map((p) => (
-              <div key={p.id} style={styles.productRow}>
-                <div style={styles.productRowInfo}>
-                  <div style={styles.productRowNombre}>{p.nombre}</div>
-                  <div style={styles.productRowMeta}>
-                    {vendedorById[p.vendedorId]?.nombre} · {p.categoria} · {money(p.precio)}
-                  </div>
-                </div>
-                <button onClick={() => adminEliminarProducto(p.id)} style={styles.smallBtnDanger}>Eliminar</button>
+          <div style={styles.statsRow}>
+            <div style={styles.statBox}>
+              <div style={styles.statNum}>{vendedores.length}</div>
+              <div style={styles.statLabel}>Vendedores</div>
+            </div>
+            <div style={styles.statBox}>
+              <div style={styles.statNum}>{productos.length}</div>
+              <div style={styles.statLabel}>Productos</div>
+            </div>
+            <div style={styles.statBox}>
+              <div style={styles.statNum}>
+                {money(vendedores.filter((v) => diasRestantes(v.ultimoPago) > 0).length * CUOTA_MENSUAL)}
               </div>
-            ))}
+              <div style={styles.statLabel}>Ingreso mensual activo</div>
+            </div>
           </div>
+
+          <h3 style={styles.subTitle}>Vendedores</h3>
+          {vendedores.length === 0 ? (
+            <div style={styles.emptyState}>Sin vendedores registrados.</div>
+          ) : (
+            <div style={styles.listado}>
+              {vendedores.map((v) => {
+                const dias = diasRestantes(v.ultimoPago);
+                return (
+                  <div key={v.id} style={styles.filaProducto}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={styles.filaNombre}>
+                        {v.nombre} {v.activo === false && <span style={styles.tagPausado}>Suspendido</span>}
+                      </div>
+                      <div style={styles.filaDetalle}>
+                        {v.ciudad} · WA {v.whatsapp} · Ventas: {v.ventas || 0} ·{" "}
+                        {dias > 0 ? `Vigente ${dias}d` : "VENCIDO"}
+                      </div>
+                    </div>
+                    <div style={styles.filaAcciones}>
+                      <button style={styles.btnMini} onClick={() => adminMarcarPago(v.id)}>💰 Pago</button>
+                      <button style={styles.btnMini} onClick={() => adminToggleActivoVendedor(v.id)}>
+                        {v.activo === false ? "Activar" : "Suspender"}
+                      </button>
+                      <button
+                        style={{ ...styles.btnMini, color: RED }}
+                        onClick={() =>
+                          window.confirm("¿Eliminar vendedor y todos sus productos?") &&
+                          adminEliminarVendedor(v.id)
+                        }
+                      >
+                        Eliminar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <h3 style={styles.subTitle}>Productos</h3>
+          {productos.length === 0 ? (
+            <div style={styles.emptyState}>Sin productos publicados.</div>
+          ) : (
+            <div style={styles.listado}>
+              {productos.map((p) => (
+                <div key={p.id} style={styles.filaProducto}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={styles.filaNombre}>{p.nombre}</div>
+                    <div style={styles.filaDetalle}>
+                      {money(p.precio)} · {vendedorById[p.vendedorId]?.nombre || "—"}
+                    </div>
+                  </div>
+                  <button
+                    style={{ ...styles.btnMini, color: RED }}
+                    onClick={() => window.confirm("¿Eliminar este producto?") && eliminarProducto(p.id)}
+                  >
+                    Eliminar
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
-      {/* ---------- MODAL: registro vendedor ---------- */}
+      {/* ---------- MODAL REGISTRO VENDEDOR ---------- */}
       {showRegistroVendedor && (
-        <div style={styles.modalOverlay} onClick={() => setShowRegistroVendedor(false)}>
+        <div style={styles.overlay} onClick={() => setShowRegistroVendedor(false)}>
           <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-            <div style={styles.modalTitle}>Registra tu tienda</div>
+            <h3 style={styles.modalTitle}>Crea tu tienda</h3>
+            <p style={styles.modalSub}>
+              Publica tus productos y recibe pedidos directo por WhatsApp. Primer mes de prueba incluido;
+              después {money(CUOTA_MENSUAL)}/mes.
+            </p>
             <input
-              style={styles.modalInput}
-              placeholder="Nombre de tu tienda"
+              style={styles.input}
+              placeholder="Nombre de tu tienda o negocio"
               value={nuevoVendedor.nombre}
-              onChange={(e) => setNuevoVendedor((s) => ({ ...s, nombre: e.target.value }))}
+              onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, nombre: e.target.value })}
             />
             <input
-              style={styles.modalInput}
-              placeholder="WhatsApp (con código de país, ej. 528331234567)"
+              style={styles.input}
+              placeholder="WhatsApp (10 dígitos)"
               value={nuevoVendedor.whatsapp}
-              onChange={(e) => setNuevoVendedor((s) => ({ ...s, whatsapp: e.target.value }))}
+              onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, whatsapp: e.target.value })}
             />
             <select
-              style={styles.modalInput}
+              style={styles.input}
               value={nuevoVendedor.ciudad}
-              onChange={(e) => setNuevoVendedor((s) => ({ ...s, ciudad: e.target.value }))}
+              onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, ciudad: e.target.value })}
             >
-              {CIUDADES.map((c) => <option key={c} value={c}>{c}</option>)}
+              {CIUDADES.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
             </select>
-            <div style={styles.modalActions}>
-              <button onClick={registrarVendedor} style={styles.modalConfirmBtn}>Crear mi tienda</button>
-              <button onClick={() => setShowRegistroVendedor(false)} style={styles.modalCancelBtn}>Cancelar</button>
-            </div>
+            <button style={styles.btnPrimario} onClick={registrarVendedor}>Crear mi tienda</button>
+            <button style={styles.btnLink} onClick={() => setShowRegistroVendedor(false)}>Cancelar</button>
           </div>
         </div>
       )}
 
-      {/* ---------- MODAL: producto ---------- */}
-      {productoForm && (
-        <div style={styles.modalOverlay} onClick={() => setProductoForm(null)}>
-          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-            <div style={styles.modalTitle}>{productoForm.id ? "Editar producto" : "Nuevo producto"}</div>
-            <input
-              style={styles.modalInput}
-              placeholder="Nombre del producto"
-              value={productoForm.nombre}
-              onChange={(e) => setProductoForm((f) => ({ ...f, nombre: e.target.value }))}
-            />
-            <input
-              style={styles.modalInput}
-              type="number"
-              placeholder="Precio (MXN)"
-              value={productoForm.precio}
-              onChange={(e) => setProductoForm((f) => ({ ...f, precio: e.target.value }))}
-            />
-            <select
-              style={styles.modalInput}
-              value={productoForm.categoria}
-              onChange={(e) => setProductoForm((f) => ({ ...f, categoria: e.target.value }))}
-            >
-              {CATEGORIAS.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-            <select
-              style={styles.modalInput}
-              value={productoForm.ciudad}
-              onChange={(e) => setProductoForm((f) => ({ ...f, ciudad: e.target.value }))}
-            >
-              {CIUDADES.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-            {productoForm.imagenes && productoForm.imagenes.length > 0 && (
-              <div style={styles.thumbRow}>
-                {productoForm.imagenes.map((img, idx) => (
-                  <div key={idx} style={styles.thumbWrap}>
-                    <img
-                      src={img}
-                      alt={`Foto ${idx + 1}`}
-                      style={styles.thumbImg}
-                      onClick={() => setLightbox({ imagenes: productoForm.imagenes, index: idx })}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => quitarImagenForm(idx)}
-                      style={styles.thumbRemoveBtn}
-                      aria-label="Quitar foto"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div style={styles.imagenesHint}>
-              {(productoForm.imagenes?.length || 0)}/{MAX_IMAGENES} fotos · sube al menos 3 para que se vea mejor tu producto
-            </div>
-            {(productoForm.imagenes?.length || 0) < MAX_IMAGENES && (
-              <label style={styles.fileUploadBtn}>
-                {subiendoImagen ? "Procesando fotos…" : "📷 Agregar fotos"}
-                <input
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={handleImagenFiles}
-                  style={styles.fileInputHidden}
-                  disabled={subiendoImagen}
-                />
-              </label>
-            )}
-            <input
-              style={styles.modalInput}
-              type="number"
-              placeholder="Stock disponible"
-              value={productoForm.stock}
-              onChange={(e) => setProductoForm((f) => ({ ...f, stock: e.target.value }))}
-            />
-            <div style={styles.modalActions}>
-              <button
-                onClick={guardarProducto}
-                disabled={subiendoImagen}
-                style={{ ...styles.modalConfirmBtn, opacity: subiendoImagen ? 0.5 : 1 }}
-              >
-                Guardar
-              </button>
-              <button onClick={() => setProductoForm(null)} style={styles.modalCancelBtn}>Cancelar</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ---------- MODAL: admin login ---------- */}
+      {/* ---------- MODAL LOGIN ADMIN ---------- */}
       {showAdminLogin && (
-        <div style={styles.modalOverlay} onClick={() => setShowAdminLogin(false)}>
+        <div style={styles.overlay} onClick={() => setShowAdminLogin(false)}>
           <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-            <div style={styles.modalTitle}>Acceso administrador</div>
+            <h3 style={styles.modalTitle}>Acceso administrador</h3>
             <input
+              style={styles.input}
               type="password"
-              style={styles.modalInput}
               placeholder="Contraseña"
               value={adminInput}
               onChange={(e) => setAdminInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && tryAdminLogin()}
             />
-            {adminError && <div style={styles.adminErrorText}>{adminError}</div>}
-            <div style={styles.modalActions}>
-              <button onClick={tryAdminLogin} style={styles.modalConfirmBtn}>Entrar</button>
-              <button onClick={() => setShowAdminLogin(false)} style={styles.modalCancelBtn}>Cancelar</button>
-            </div>
+            {adminError && <div style={{ color: RED, fontSize: 13, marginBottom: 8 }}>{adminError}</div>}
+            <button style={styles.btnPrimario} onClick={tryAdminLogin}>Entrar</button>
+            <button style={styles.btnLink} onClick={() => setShowAdminLogin(false)}>Cancelar</button>
           </div>
         </div>
       )}
 
-      {cartCount > 0 && !cartOpen && (
-        <button style={styles.floatingCartBar} onClick={() => setCartOpen(true)}>
-          <span style={styles.floatingCartLeft}>
-            🛒 {cartCount} {cartCount === 1 ? "producto" : "productos"}
-          </span>
-          <span style={styles.floatingCartRight}>{money(carritoTotal)} · Ver carrito →</span>
-        </button>
+      {/* ---------- MODAL FORM PRODUCTO ---------- */}
+      {productoForm && (
+        <div style={styles.overlay} onClick={() => setProductoForm(null)}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <h3 style={styles.modalTitle}>{productoForm.id ? "Editar producto" : "Publicar producto"}</h3>
+            <input
+              style={styles.input}
+              placeholder="Nombre del producto"
+              value={productoForm.nombre}
+              onChange={(e) => setProductoForm({ ...productoForm, nombre: e.target.value })}
+            />
+            <input
+              style={styles.input}
+              type="number"
+              placeholder="Precio (MXN)"
+              value={productoForm.precio}
+              onChange={(e) => setProductoForm({ ...productoForm, precio: e.target.value })}
+            />
+            <input
+              style={styles.input}
+              type="number"
+              placeholder="Stock disponible"
+              value={productoForm.stock}
+              onChange={(e) => setProductoForm({ ...productoForm, stock: e.target.value })}
+            />
+            <select
+              style={styles.input}
+              value={productoForm.categoria}
+              onChange={(e) => setProductoForm({ ...productoForm, categoria: e.target.value })}
+            >
+              {CATEGORIAS.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+            <select
+              style={styles.input}
+              value={productoForm.ciudad}
+              onChange={(e) => setProductoForm({ ...productoForm, ciudad: e.target.value })}
+            >
+              {CIUDADES.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+
+            <label style={styles.uploadBtn}>
+              {subiendoImagen ? "Procesando fotos…" : `📷 Agregar fotos (${(productoForm.imagenes || []).length}/${MAX_IMAGENES})`}
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                style={{ display: "none" }}
+                onChange={handleImagenFiles}
+                disabled={subiendoImagen || (productoForm.imagenes || []).length >= MAX_IMAGENES}
+              />
+            </label>
+
+            {(productoForm.imagenes || []).length > 0 && (
+              <div style={styles.thumbRow}>
+                {productoForm.imagenes.map((img, idx) => (
+                  <div key={idx} style={styles.thumbWrap}>
+                    <img src={img} alt="" style={styles.thumbImg} />
+                    <button style={styles.thumbX} onClick={() => quitarImagenForm(idx)}>✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <button style={styles.btnPrimario} onClick={guardarProducto} disabled={subiendoImagen}>
+              {productoForm.id ? "Guardar cambios" : "Publicar"}
+            </button>
+            <button style={styles.btnLink} onClick={() => setProductoForm(null)}>Cancelar</button>
+          </div>
+        </div>
       )}
 
-      {/* ---------- DRAWER: carrito ---------- */}
+      {/* ---------- LIGHTBOX ---------- */}
+      {lightbox && (
+        <div style={styles.lightboxOverlay} onClick={() => setLightbox(null)}>
+          <img
+            src={lightbox.imagenes[lightbox.index]}
+            alt=""
+            style={styles.lightboxImg}
+            onClick={(e) => e.stopPropagation()}
+          />
+          {lightbox.imagenes.length > 1 && (
+            <div style={styles.lightboxNav} onClick={(e) => e.stopPropagation()}>
+              <button
+                style={styles.lightboxBtn}
+                onClick={() =>
+                  setLightbox((lb) => ({
+                    ...lb,
+                    index: (lb.index - 1 + lb.imagenes.length) % lb.imagenes.length,
+                  }))
+                }
+              >
+                ‹
+              </button>
+              <span style={{ color: "#fff", fontSize: 14 }}>
+                {lightbox.index + 1} / {lightbox.imagenes.length}
+              </span>
+              <button
+                style={styles.lightboxBtn}
+                onClick={() =>
+                  setLightbox((lb) => ({ ...lb, index: (lb.index + 1) % lb.imagenes.length }))
+                }
+              >
+                ›
+              </button>
+            </div>
+          )}
+          <button style={styles.lightboxClose} onClick={() => setLightbox(null)}>✕</button>
+        </div>
+      )}
+
+      {/* ---------- CARRITO (DRAWER) ---------- */}
       {cartOpen && (
-        <div style={styles.modalOverlay} onClick={() => setCartOpen(false)}>
-          <div style={styles.cartDrawer} onClick={(e) => e.stopPropagation()}>
-            <div style={styles.cartHeader}>
-              <div style={styles.modalTitle}>Tu carrito</div>
-              <button onClick={() => setCartOpen(false)} style={styles.closeBtn}>×</button>
+        <div style={styles.overlay} onClick={() => setCartOpen(false)}>
+          <div style={styles.drawer} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.drawerHeader}>
+              <h3 style={styles.modalTitle}>🛒 Tu carrito</h3>
+              <button style={styles.btnLink} onClick={() => setCartOpen(false)}>Cerrar</button>
             </div>
 
             {carritoDetallado.length === 0 ? (
-              <div style={styles.emptyState}>Tu carrito está vacío.</div>
+              <div style={styles.emptyState}>Tu carrito está vacío. ¡Agrega algo que te guste!</div>
             ) : (
               <>
-                <div style={styles.cartItems}>
-                  {Object.entries(carritoPorVendedor).map(([vendedorId, items]) => {
-                    const tipoEntrega = entregaPorVendedor[vendedorId] || "recoger";
-                    const subtotalVendedor = items.reduce((s, it) => s + it.producto.precio * it.cantidad, 0);
-                    const totalVendedor = subtotalVendedor + (tipoEntrega === "domicilio" ? COSTO_ENVIO : 0);
-                    return (
-                    <div key={vendedorId} style={styles.cartVendorGroup}>
-                      <div style={styles.cartVendorName}>{vendedorById[vendedorId]?.nombre}</div>
+                {Object.entries(carritoPorVendedor).map(([vId, items]) => {
+                  const vendedor = vendedorById[vId];
+                  const tipoEntrega = entregaPorVendedor[vId] || "recoger";
+                  const subtotal = items.reduce((s, it) => s + it.producto.precio * it.cantidad, 0);
+                  return (
+                    <div key={vId} style={styles.cartGroup}>
+                      <div style={styles.cartGroupTitle}>🏪 {vendedor?.nombre || "Vendedor"}</div>
                       {items.map((item) => (
-                        <div key={item.productoId} style={styles.cartItemRow}>
-                          <div style={styles.cartItemName}>{item.producto.nombre}</div>
-                          <div style={styles.cartItemControls}>
-                            <button onClick={() => cambiarCantidad(item.productoId, -1)} style={styles.qtyBtn}>−</button>
-                            <span style={styles.qtyText}>{item.cantidad}</span>
-                            <button onClick={() => cambiarCantidad(item.productoId, 1)} style={styles.qtyBtn}>+</button>
+                        <div key={item.productoId} style={styles.cartItem}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={styles.filaNombre}>{item.producto.nombre}</div>
+                            <div style={styles.filaDetalle}>{money(item.producto.precio)} c/u</div>
                           </div>
-                          <div style={styles.cartItemPrice}>{money(item.producto.precio * item.cantidad)}</div>
-                          <button onClick={() => quitarDelCarrito(item.productoId)} style={styles.cartRemoveBtn}>×</button>
+                          <div style={styles.qtyRow}>
+                            <button style={styles.qtyBtn} onClick={() => cambiarCantidad(item.productoId, -1)}>−</button>
+                            <span style={styles.qtyNum}>{item.cantidad}</span>
+                            <button style={styles.qtyBtn} onClick={() => cambiarCantidad(item.productoId, 1)}>+</button>
+                            <button
+                              style={{ ...styles.btnMini, color: RED }}
+                              onClick={() => quitarDelCarrito(item.productoId)}
+                            >
+                              ✕
+                            </button>
+                          </div>
                         </div>
                       ))}
-
-                      <div style={styles.entregaOptions}>
+                      <div style={styles.entregaRow}>
                         <button
-                          onClick={() => elegirEntrega(vendedorId, "recoger")}
                           style={{ ...styles.entregaBtn, ...(tipoEntrega === "recoger" ? styles.entregaBtnActiva : {}) }}
+                          onClick={() => elegirEntrega(vId, "recoger")}
                         >
-                          🏠 Recoger — gratis
+                          🏠 Recoger (gratis)
                         </button>
                         <button
-                          onClick={() => elegirEntrega(vendedorId, "domicilio")}
                           style={{ ...styles.entregaBtn, ...(tipoEntrega === "domicilio" ? styles.entregaBtnActiva : {}) }}
+                          onClick={() => elegirEntrega(vId, "domicilio")}
                         >
-                          🚚 A domicilio — {money(COSTO_ENVIO)}
+                          🚚 Envío (+{money(COSTO_ENVIO)})
                         </button>
                       </div>
-
-                      <div style={styles.cartSubtotalVendedor}>Subtotal con envío: {money(totalVendedor)}</div>
-
-                      <button
-                        onClick={() => checkoutPorVendedor(vendedorId)}
-                        style={styles.checkoutVendorBtn}
-                      >
-                        Pedir por WhatsApp a {vendedorById[vendedorId]?.nombre}
+                      <div style={styles.cartSubtotal}>
+                        Subtotal: {money(subtotal + (tipoEntrega === "domicilio" ? COSTO_ENVIO : 0))}
+                      </div>
+                      <button style={styles.btnPrimario} onClick={() => checkoutPorVendedor(vId)}>
+                        Pedir por WhatsApp
                       </button>
                     </div>
-                    );
-                  })}
-                </div>
-                <div style={styles.cartTotal}>Total: {money(carritoTotal)}</div>
+                  );
+                })}
+                <div style={styles.cartTotal}>Total general: {money(carritoTotal)}</div>
               </>
             )}
           </div>
         </div>
       )}
 
-      {/* ---------- LIGHTBOX: visor de fotos ampliado ---------- */}
-      {lightbox && (
-        <div style={styles.lightboxOverlay} onClick={() => setLightbox(null)}>
-          <button style={styles.lightboxCloseBtn} onClick={() => setLightbox(null)} aria-label="Cerrar">×</button>
-
-          {lightbox.imagenes.length > 1 && (
-            <button
-              style={{ ...styles.lightboxNavBtn, left: 12 }}
-              onClick={(e) => {
-                e.stopPropagation();
-                setLightbox((l) => ({
-                  ...l,
-                  index: (l.index - 1 + l.imagenes.length) % l.imagenes.length,
-                }));
-              }}
-              aria-label="Foto anterior"
-            >
-              ‹
-            </button>
-          )}
-
-          <img
-            src={lightbox.imagenes[lightbox.index]}
-            alt={`Foto ${lightbox.index + 1}`}
-            style={styles.lightboxImage}
-            onClick={(e) => e.stopPropagation()}
-          />
-
-          {lightbox.imagenes.length > 1 && (
-            <button
-              style={{ ...styles.lightboxNavBtn, right: 12 }}
-              onClick={(e) => {
-                e.stopPropagation();
-                setLightbox((l) => ({
-                  ...l,
-                  index: (l.index + 1) % l.imagenes.length,
-                }));
-              }}
-              aria-label="Foto siguiente"
-            >
-              ›
-            </button>
-          )}
-
-          {lightbox.imagenes.length > 1 && (
-            <div style={styles.lightboxCounter} onClick={(e) => e.stopPropagation()}>
-              {lightbox.index + 1} / {lightbox.imagenes.length}
-            </div>
-          )}
-        </div>
-      )}
+      <footer style={styles.footer}>
+        Libre Mercado Ventas · Zona Conurbada de Tamaulipas · Pedidos directo por WhatsApp
+      </footer>
     </div>
   );
 }
 
 const styles = {
   page: {
-    fontFamily: "'Inter', sans-serif",
+    fontFamily: "'Inter', system-ui, sans-serif",
     background: BG,
     minHeight: "100vh",
     color: INK,
     paddingBottom: 60,
   },
   loadingScreen: {
+    fontFamily: "'Inter', system-ui, sans-serif",
+    background: BG,
     minHeight: "100vh",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    background: BG,
     color: DIM,
-    fontFamily: "'Inter', sans-serif",
-  },
-  toast: {
-    position: "fixed",
-    top: 16,
-    left: "50%",
-    transform: "translateX(-50%)",
-    background: INK,
-    color: "#fff",
-    padding: "10px 20px",
-    borderRadius: 999,
-    fontSize: 13,
-    fontWeight: 700,
-    zIndex: 200,
-    boxShadow: "0 8px 24px rgba(0,0,0,0.25)",
-    animation: "toastIn 0.2s ease-out",
-    whiteSpace: "nowrap",
+    fontSize: 16,
   },
   header: {
-    background: "#fff",
-    borderBottom: `1px solid ${BORDER}`,
-    padding: "18px 20px 0",
-    position: "sticky",
-    top: 0,
-    zIndex: 10,
+    padding: "18px 16px 0",
+    maxWidth: 1080,
+    margin: "0 auto",
   },
   headerTop: {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "flex-start",
-    maxWidth: 1100,
-    margin: "0 auto",
+    gap: 12,
   },
   eyebrow: {
-    fontSize: 11,
-    letterSpacing: "0.02em",
-    color: GOLD,
+    fontFamily: "'Poppins', sans-serif",
     fontWeight: 700,
-    marginBottom: 4,
+    fontSize: 12,
+    letterSpacing: 2,
+    textTransform: "uppercase",
+    color: GOLD,
   },
   title: {
     fontFamily: "'Poppins', sans-serif",
     fontWeight: 800,
-    fontSize: 22,
-    margin: 0,
+    fontSize: "clamp(22px, 4.5vw, 34px)",
+    lineHeight: 1.15,
     color: GREEN,
+    margin: "4px 0 0",
   },
   cartBtn: {
     position: "relative",
-    background: GOLD,
+    background: "#5A2A1B",
     border: "none",
-    borderRadius: 12,
-    color: "#fff",
+    borderRadius: 14,
+    padding: "12px 16px",
     fontSize: 20,
-    padding: "12px 18px",
-    boxShadow: "0 4px 14px rgba(226,96,63,0.4)",
+    color: "#fff",
   },
   cartBadge: {
     position: "absolute",
-    top: -8,
-    right: -8,
-    background: INK,
+    top: -6,
+    right: -6,
+    background: GOLD,
     color: "#fff",
-    fontSize: 12,
-    fontWeight: 800,
     borderRadius: 999,
-    minWidth: 22,
-    height: 22,
-    display: "flex",
+    fontSize: 12,
+    fontWeight: 700,
+    minWidth: 20,
+    height: 20,
+    display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
     padding: "0 5px",
-    border: "2px solid #fff",
   },
-  floatingCartBar: {
-    position: "fixed",
-    left: "50%",
-    bottom: 20,
-    transform: "translateX(-50%)",
-    animation: "floatCartIn 0.25s ease-out",
-    zIndex: 20,
-    display: "flex",
-    alignItems: "center",
-    gap: 14,
-    background: GOLD,
-    color: "#fff",
-    border: "none",
-    borderRadius: 999,
-    padding: "14px 22px",
-    boxShadow: "0 10px 30px rgba(226,96,63,0.45)",
-    fontWeight: 700,
-    fontSize: 14,
-    width: "min(92%, 420px)",
-    justifyContent: "space-between",
-  },
-  floatingCartLeft: { fontSize: 14 },
-  floatingCartRight: { fontSize: 13, opacity: 0.95 },
   nav: {
     display: "flex",
-    gap: 4,
-    maxWidth: 1100,
-    margin: "16px auto 0",
+    gap: 8,
+    marginTop: 16,
+    borderBottom: `2px solid ${BORDER}`,
   },
   navBtn: {
-    border: "none",
     background: "transparent",
-    padding: "10px 18px",
-    fontSize: 14,
+    border: "none",
+    padding: "10px 14px",
+    fontSize: 15,
     fontWeight: 600,
     color: DIM,
-    borderBottom: "2px solid transparent",
+    borderBottom: "3px solid transparent",
+    marginBottom: -2,
   },
   navBtnActive: {
     color: GREEN,
-    borderBottom: `2px solid ${GREEN}`,
+    borderBottom: `3px solid ${GREEN}`,
   },
   errorBanner: {
-    maxWidth: 1100,
-    margin: "16px auto 0",
-    background: "#FBE4E1",
-    color: "#9C3A2E",
-    border: "1px solid #EFC1BA",
-    borderRadius: 8,
-    padding: "10px 14px",
-    fontSize: 13,
+    maxWidth: 1080,
+    margin: "12px auto 0",
+    background: "#FBE9E7",
+    color: RED,
+    padding: "10px 16px",
+    borderRadius: 10,
+    fontSize: 14,
+    cursor: "pointer",
+  },
+  toast: {
+    position: "fixed",
+    top: 14,
+    left: "50%",
+    transform: "translateX(-50%)",
+    background: INK,
+    color: "#fff",
+    padding: "10px 18px",
+    borderRadius: 999,
+    fontSize: 14,
+    zIndex: 60,
+    animation: "toastIn .25s ease",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.18)",
+  },
+  savingBadge: {
+    position: "fixed",
+    bottom: 14,
+    right: 14,
+    background: INK,
+    color: "#fff",
+    padding: "6px 12px",
+    borderRadius: 999,
+    fontSize: 12,
+    zIndex: 60,
+    opacity: 0.85,
   },
   filters: {
-    maxWidth: 1100,
-    margin: "20px auto 20px",
-    padding: "0 20px",
+    maxWidth: 1080,
+    margin: "16px auto",
+    padding: "0 16px",
     display: "flex",
-    gap: 10,
     flexWrap: "wrap",
+    gap: 10,
   },
   searchInput: {
-    flex: "2 1 220px",
-    padding: "10px 14px",
-    borderRadius: 8,
+    flex: "1 1 220px",
+    padding: "12px 14px",
+    borderRadius: 12,
     border: `1px solid ${BORDER}`,
-    fontSize: 14,
+    fontSize: 15,
+    background: "#fff",
+    color: INK,
   },
   select: {
     flex: "1 1 160px",
-    padding: "10px 14px",
-    borderRadius: 8,
+    padding: "12px 14px",
+    borderRadius: 12,
     border: `1px solid ${BORDER}`,
-    fontSize: 14,
+    fontSize: 15,
     background: "#fff",
+    color: INK,
+  },
+  emptyState: {
+    maxWidth: 1080,
+    margin: "40px auto",
+    padding: "0 16px",
+    textAlign: "center",
+    color: DIM,
+    fontSize: 15,
   },
   grid: {
-    maxWidth: 1100,
+    maxWidth: 1080,
     margin: "0 auto",
-    padding: "0 20px",
+    padding: "0 16px",
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))",
-    gap: 16,
+    gridTemplateColumns: "repeat(auto-fill, minmax(165px, 1fr))",
+    gap: 14,
   },
   card: {
     background: "#fff",
-    border: `1px solid ${BORDER}`,
-    borderRadius: 14,
+    borderRadius: 16,
     overflow: "hidden",
-    transition: "box-shadow 0.15s ease, transform 0.15s ease",
+    border: `1px solid ${BORDER}`,
+    transition: "box-shadow .2s ease, transform .2s ease",
+    display: "flex",
+    flexDirection: "column",
   },
   cardImageWrap: {
-    height: 140,
-    background: "#EFE6D5",
+    position: "relative",
+    aspectRatio: "1 / 1",
+    background: "#EFE7D8",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    position: "relative",
+    overflow: "hidden",
   },
   cardImage: { width: "100%", height: "100%", objectFit: "cover" },
   cardImageCount: {
@@ -1183,432 +1226,336 @@ const styles = {
     right: 8,
     background: "rgba(18,58,61,0.75)",
     color: "#fff",
-    fontSize: 11,
-    fontWeight: 700,
-    padding: "3px 8px",
-    borderRadius: 999,
-  },
-  cardImagePlaceholder: { fontSize: 36, opacity: 0.4 },
-  cardBody: { padding: 14 },
-  cardCategoria: { fontSize: 11, color: DIM, marginBottom: 4, fontWeight: 600 },
-  cardNombre: { fontSize: 15, fontWeight: 700, marginBottom: 4 },
-  cardPrecio: { fontSize: 16, fontWeight: 800, color: GREEN, marginBottom: 4 },
-  cardVendedor: { fontSize: 12, color: DIM, marginBottom: 10 },
-  repBadgeInline: { color: GREEN, fontWeight: 700 },
-  cardBtn: {
-    width: "100%",
-    padding: "9px",
-    borderRadius: 8,
-    border: "none",
-    background: INK,
-    color: "#fff",
-    fontWeight: 600,
-    fontSize: 13,
-  },
-  emptyState: {
-    maxWidth: 1100,
-    margin: "40px auto",
-    textAlign: "center",
-    color: DIM,
-    fontSize: 14,
-    padding: "0 20px",
-  },
-  sectionTitle: {
-    fontFamily: "'Poppins', sans-serif",
-    fontSize: 16,
-    fontWeight: 700,
-    maxWidth: 1100,
-    margin: "0 auto 12px",
-    padding: "0 20px",
-  },
-  adminPanelHeader: {
-    maxWidth: 1100,
-    margin: "20px auto 16px",
-    padding: "0 20px",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  adminPanelBadge: {
-    fontSize: 13,
-    fontWeight: 700,
-    color: GREEN,
-    background: "#E4F5F3",
-    padding: "6px 12px",
-    borderRadius: 999,
-  },
-  vendedorHeader: {
-    maxWidth: 1100,
-    margin: "20px auto 16px",
-    padding: "0 20px",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  vendedorNombre: { fontFamily: "'Poppins', sans-serif", fontWeight: 700, fontSize: 18 },
-  vendedorMeta: { fontSize: 13, color: DIM },
-  vendedorRep: { fontSize: 13, color: GREEN, fontWeight: 700, marginTop: 4 },
-  logoutBtn: {
-    border: `1px solid ${BORDER}`,
-    background: "#fff",
-    borderRadius: 8,
-    padding: "8px 14px",
-    fontSize: 13,
-    fontWeight: 600,
-    color: DIM,
-  },
-  newProductBtn: {
-    display: "block",
-    margin: "0 auto 20px",
-    maxWidth: 1060,
-    marginLeft: 20,
-    padding: "10px 18px",
-    borderRadius: 8,
-    border: "none",
-    background: GREEN,
-    color: "#fff",
-    fontWeight: 700,
-    fontSize: 14,
-  },
-  productTable: {
-    maxWidth: 1100,
-    margin: "0 auto",
-    padding: "0 20px",
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-  },
-  productRow: {
-    background: "#fff",
-    border: `1px solid ${BORDER}`,
-    borderRadius: 10,
-    padding: "12px 16px",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: 10,
-  },
-  productRowInfo: {},
-  productRowNombre: { fontWeight: 700, fontSize: 14 },
-  productRowInactivo: { color: DIM, textDecoration: "line-through" },
-  productRowMeta: { fontSize: 12, color: DIM, marginTop: 2 },
-  productRowActions: { display: "flex", gap: 6 },
-  smallBtnVenta: {
-    border: "none",
-    background: GREEN,
-    color: "#fff",
-    borderRadius: 6,
-    padding: "6px 10px",
     fontSize: 12,
-    fontWeight: 700,
+    padding: "2px 8px",
+    borderRadius: 999,
   },
-  smallBtnOutline: {
+  cardImagePlaceholder: { fontSize: 40, opacity: 0.5 },
+  cardBody: { padding: 12, display: "flex", flexDirection: "column", gap: 4, flex: 1 },
+  cardCategoria: { fontSize: 11, color: DIM, textTransform: "uppercase", letterSpacing: 0.5 },
+  cardNombre: { fontWeight: 600, fontSize: 15, lineHeight: 1.3 },
+  cardPrecio: {
+    fontFamily: "'Poppins', sans-serif",
+    fontWeight: 700,
+    fontSize: 17,
+    color: GREEN,
+  },
+  cardVendedor: { fontSize: 12, color: DIM, marginBottom: 6 },
+  btnPrimario: {
+    background: GREEN,
+    color: "#fff",
+    border: "none",
+    borderRadius: 12,
+    padding: "12px 16px",
+    fontSize: 15,
+    fontWeight: 700,
+    width: "100%",
+    marginTop: "auto",
+  },
+  btnLink: {
+    background: "transparent",
+    border: "none",
+    color: DIM,
+    fontSize: 14,
+    fontWeight: 600,
+    padding: "10px 6px",
+    textDecoration: "underline",
+  },
+  btnMini: {
+    background: "#F1F6F5",
     border: `1px solid ${BORDER}`,
-    background: "#fff",
-    borderRadius: 6,
+    borderRadius: 8,
     padding: "6px 10px",
     fontSize: 12,
     fontWeight: 600,
     color: INK,
   },
-  smallBtnDanger: {
-    border: "none",
-    background: "#FBE4E1",
-    color: "#9C3A2E",
-    borderRadius: 6,
-    padding: "6px 10px",
-    fontSize: 12,
-    fontWeight: 600,
+  panel: { maxWidth: 1080, margin: "20px auto", padding: "0 16px" },
+  panelHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 12,
+    flexWrap: "wrap",
   },
-  smallBtnPago: {
-    border: "none",
-    background: "#E4F5F3",
-    color: GREEN,
-    borderRadius: 6,
-    padding: "6px 10px",
-    fontSize: 12,
+  panelTitle: {
+    fontFamily: "'Poppins', sans-serif",
     fontWeight: 700,
+    fontSize: 22,
+    margin: 0,
+    color: INK,
   },
-  pagoStatus: {
-    fontSize: 12,
-    fontWeight: 600,
-    marginTop: 6,
+  panelSub: { fontSize: 13, color: DIM, marginTop: 4 },
+  subTitle: {
+    fontFamily: "'Poppins', sans-serif",
+    fontWeight: 700,
+    fontSize: 17,
+    margin: "24px 0 10px",
+    color: INK,
   },
-  pagoVigente: { color: GREEN },
-  pagoVencido: { color: "#9C3A2E" },
-  pausadoTag: {
-    fontSize: 10,
-    fontWeight: 800,
-    color: "#9C3A2E",
-    background: "#FBE4E1",
-    padding: "2px 6px",
-    borderRadius: 4,
-    letterSpacing: "0.04em",
-  },
-  vendorPagoBanner: {
-    maxWidth: 1060,
-    margin: "0 20px 16px",
+  avisoVerde: {
+    background: "#E5F4EF",
+    color: "#1B7A5A",
     padding: "10px 14px",
-    borderRadius: 8,
-    fontSize: 13,
-    fontWeight: 600,
+    borderRadius: 10,
+    fontSize: 14,
+    margin: "14px 0",
   },
-  pagoVigenteBanner: { background: "#E4F5F3", color: GREEN },
-  pagoVencidoBanner: { background: "#FBE4E1", color: "#9C3A2E" },
-  modalOverlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(20,25,35,0.5)",
+  avisoAmarillo: {
+    background: "#FCF3DC",
+    color: "#9C6B14",
+    padding: "10px 14px",
+    borderRadius: 10,
+    fontSize: 14,
+    margin: "14px 0",
+  },
+  avisoRojo: {
+    background: "#FBE9E7",
+    color: RED,
+    padding: "10px 14px",
+    borderRadius: 10,
+    fontSize: 14,
+    margin: "14px 0",
+  },
+  listado: { display: "flex", flexDirection: "column", gap: 10, marginTop: 14 },
+  filaProducto: {
+    background: "#fff",
+    border: `1px solid ${BORDER}`,
+    borderRadius: 14,
+    padding: 12,
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    flexWrap: "wrap",
+  },
+  filaThumb: {
+    width: 54,
+    height: 54,
+    borderRadius: 10,
+    background: "#EFE7D8",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    zIndex: 50,
+    fontSize: 22,
+    overflow: "hidden",
+    flexShrink: 0,
+  },
+  filaThumbImg: { width: "100%", height: "100%", objectFit: "cover" },
+  filaNombre: { fontWeight: 600, fontSize: 15 },
+  filaDetalle: { fontSize: 13, color: DIM },
+  filaAcciones: { display: "flex", gap: 6, flexWrap: "wrap" },
+  tagPausado: {
+    background: "#FCF3DC",
+    color: "#9C6B14",
+    fontSize: 11,
+    fontWeight: 700,
+    padding: "2px 8px",
+    borderRadius: 999,
+    marginLeft: 6,
+  },
+  statsRow: { display: "flex", gap: 12, flexWrap: "wrap", margin: "16px 0" },
+  statBox: {
+    flex: "1 1 140px",
+    background: "#fff",
+    border: `1px solid ${BORDER}`,
+    borderRadius: 14,
+    padding: 16,
+    textAlign: "center",
+  },
+  statNum: {
+    fontFamily: "'Poppins', sans-serif",
+    fontWeight: 800,
+    fontSize: 22,
+    color: GREEN,
+  },
+  statLabel: { fontSize: 12, color: DIM, marginTop: 4 },
+  overlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(18,58,61,0.45)",
+    zIndex: 40,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
     padding: 16,
   },
   modal: {
     background: "#fff",
-    borderRadius: 14,
-    padding: 22,
+    borderRadius: 18,
+    padding: 20,
     width: "100%",
-    maxWidth: 360,
-    maxHeight: "85vh",
+    maxWidth: 420,
+    maxHeight: "90vh",
     overflowY: "auto",
-  },
-  modalTitle: { fontFamily: "'Poppins', sans-serif", fontWeight: 700, fontSize: 16, marginBottom: 14 },
-  modalInput: {
-    width: "100%",
-    padding: "10px 12px",
-    borderRadius: 8,
-    border: `1px solid ${BORDER}`,
-    fontSize: 14,
-    marginBottom: 10,
-  },
-  thumbRow: {
     display: "flex",
-    flexWrap: "wrap",
-    gap: 8,
-    marginBottom: 8,
+    flexDirection: "column",
+    gap: 10,
   },
-  thumbWrap: {
-    position: "relative",
-    width: 68,
-    height: 68,
+  modalTitle: {
+    fontFamily: "'Poppins', sans-serif",
+    fontWeight: 700,
+    fontSize: 19,
+    margin: 0,
+    color: INK,
   },
+  modalSub: { fontSize: 13, color: DIM, margin: 0 },
+  input: {
+    padding: "12px 14px",
+    borderRadius: 12,
+    border: `1px solid ${BORDER}`,
+    fontSize: 15,
+    background: "#fff",
+    color: INK,
+    width: "100%",
+  },
+  uploadBtn: {
+    display: "block",
+    textAlign: "center",
+    background: "#F1F6F5",
+    border: `1px dashed ${GREEN}`,
+    borderRadius: 12,
+    padding: "12px 14px",
+    fontSize: 14,
+    fontWeight: 600,
+    color: GREEN,
+    cursor: "pointer",
+  },
+  thumbRow: { display: "flex", gap: 8, flexWrap: "wrap" },
+  thumbWrap: { position: "relative", width: 64, height: 64 },
   thumbImg: {
     width: "100%",
     height: "100%",
     objectFit: "cover",
-    borderRadius: 8,
+    borderRadius: 10,
     border: `1px solid ${BORDER}`,
-    cursor: "zoom-in",
   },
-  thumbRemoveBtn: {
+  thumbX: {
     position: "absolute",
     top: -6,
     right: -6,
-    width: 20,
-    height: 20,
-    borderRadius: "50%",
-    border: "2px solid #fff",
     background: RED,
     color: "#fff",
-    fontSize: 12,
-    lineHeight: "12px",
-    padding: 0,
-  },
-  imagenesHint: {
-    fontSize: 11,
-    color: DIM,
-    marginBottom: 8,
-  },
-  fileUploadBtn: {
-    display: "block",
-    width: "100%",
-    textAlign: "center",
-    padding: "11px",
-    borderRadius: 8,
-    border: `1px dashed ${GREEN}`,
-    background: "#EAF7F5",
-    color: GREEN,
-    fontWeight: 600,
-    fontSize: 13,
-    marginBottom: 10,
-    cursor: "pointer",
-    position: "relative",
-  },
-  fileInputHidden: {
-    position: "absolute",
-    width: 1,
-    height: 1,
-    padding: 0,
-    margin: -1,
-    overflow: "hidden",
-    clip: "rect(0,0,0,0)",
-    border: 0,
-  },
-  modalActions: { display: "flex", gap: 8, marginTop: 4 },
-  modalConfirmBtn: {
-    flex: 1,
-    padding: "11px",
-    borderRadius: 8,
     border: "none",
-    background: GREEN,
-    color: "#fff",
-    fontWeight: 700,
-    fontSize: 14,
+    borderRadius: 999,
+    width: 20,
+    height: 20,
+    fontSize: 11,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  modalCancelBtn: {
-    padding: "11px 16px",
-    borderRadius: 8,
-    border: `1px solid ${BORDER}`,
-    background: "transparent",
-    color: DIM,
-    fontWeight: 600,
-    fontSize: 14,
-  },
-  adminErrorText: { fontSize: 12, color: "#9C3A2E", marginBottom: 10 },
-  cartDrawer: {
+  drawer: {
     background: "#fff",
-    borderRadius: 14,
+    borderRadius: "18px 0 0 18px",
     padding: 20,
     width: "100%",
     maxWidth: 420,
-    maxHeight: "85vh",
+    height: "100%",
+    marginLeft: "auto",
+    overflowY: "auto",
+    animation: "floatCartIn .25s ease",
     display: "flex",
     flexDirection: "column",
+    gap: 12,
   },
-  cartHeader: { display: "flex", justifyContent: "space-between", alignItems: "center" },
-  closeBtn: { border: "none", background: "transparent", fontSize: 22, color: DIM, lineHeight: "20px" },
-  cartItems: { overflowY: "auto", flex: 1 },
-  cartVendorGroup: {
-    borderBottom: `1px solid ${BORDER}`,
-    paddingBottom: 14,
-    marginBottom: 14,
-  },
-  cartVendorName: { fontWeight: 700, fontSize: 13, color: GREEN, marginBottom: 8 },
-  cartItemRow: {
+  drawerHeader: { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  cartGroup: {
+    border: `1px solid ${BORDER}`,
+    borderRadius: 14,
+    padding: 12,
     display: "flex",
-    alignItems: "center",
-    gap: 8,
-    marginBottom: 8,
+    flexDirection: "column",
+    gap: 10,
   },
-  cartItemName: { flex: 1, fontSize: 13, fontWeight: 600 },
-  cartItemControls: { display: "flex", alignItems: "center", gap: 6 },
+  cartGroupTitle: { fontWeight: 700, fontSize: 15 },
+  cartItem: { display: "flex", alignItems: "center", gap: 10 },
+  qtyRow: { display: "flex", alignItems: "center", gap: 6 },
   qtyBtn: {
-    width: 22,
-    height: 22,
-    borderRadius: 6,
+    background: "#F1F6F5",
     border: `1px solid ${BORDER}`,
-    background: "#fff",
-    fontSize: 13,
-    lineHeight: "13px",
-  },
-  qtyText: { fontSize: 13, fontWeight: 600, minWidth: 16, textAlign: "center" },
-  cartItemPrice: { fontSize: 13, fontWeight: 700, minWidth: 70, textAlign: "right" },
-  cartRemoveBtn: { border: "none", background: "transparent", color: DIM, fontSize: 16 },
-  entregaOptions: {
-    display: "flex",
-    gap: 6,
-    marginTop: 8,
-    marginBottom: 8,
-  },
-  entregaBtn: {
-    flex: 1,
-    padding: "8px 6px",
     borderRadius: 8,
-    border: `1px solid ${BORDER}`,
-    background: "#fff",
-    color: DIM,
-    fontSize: 12,
-    fontWeight: 600,
-  },
-  entregaBtnActiva: {
-    border: `1px solid ${GREEN}`,
-    background: "#E4F5F3",
-    color: GREEN,
-  },
-  cartSubtotalVendedor: {
-    fontSize: 12,
+    width: 28,
+    height: 28,
+    fontSize: 16,
     fontWeight: 700,
     color: INK,
-    marginBottom: 8,
-    textAlign: "right",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  checkoutVendorBtn: {
-    width: "100%",
-    marginTop: 6,
-    padding: "9px",
-    borderRadius: 8,
-    border: "none",
-    background: "#25D366",
-    color: "#fff",
-    fontWeight: 700,
-    fontSize: 13,
+  qtyNum: { fontWeight: 700, minWidth: 18, textAlign: "center" },
+  entregaRow: { display: "flex", gap: 8 },
+  entregaBtn: {
+    flex: 1,
+    background: "#F1F6F5",
+    border: `1px solid ${BORDER}`,
+    borderRadius: 10,
+    padding: "8px 10px",
+    fontSize: 12,
+    fontWeight: 600,
+    color: DIM,
   },
+  entregaBtnActiva: {
+    background: "#E5F4EF",
+    border: `1px solid ${GREEN}`,
+    color: GREEN,
+  },
+  cartSubtotal: { fontSize: 14, fontWeight: 700, textAlign: "right" },
   cartTotal: {
-    borderTop: `1px solid ${BORDER}`,
-    paddingTop: 14,
-    marginTop: 10,
+    fontFamily: "'Poppins', sans-serif",
     fontWeight: 800,
-    fontSize: 16,
+    fontSize: 18,
+    color: GREEN,
     textAlign: "right",
+    marginTop: 4,
   },
   lightboxOverlay: {
     position: "fixed",
     inset: 0,
-    background: "rgba(10,15,20,0.92)",
+    background: "rgba(10,20,22,0.92)",
+    zIndex: 50,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 14,
+    padding: 16,
+  },
+  lightboxImg: {
+    maxWidth: "94vw",
+    maxHeight: "78vh",
+    borderRadius: 12,
+    objectFit: "contain",
+  },
+  lightboxNav: { display: "flex", alignItems: "center", gap: 18 },
+  lightboxBtn: {
+    background: "rgba(255,255,255,0.14)",
+    color: "#fff",
+    border: "none",
+    borderRadius: 999,
+    width: 42,
+    height: 42,
+    fontSize: 24,
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    zIndex: 100,
-    padding: 20,
   },
-  lightboxImage: {
-    maxWidth: "92vw",
-    maxHeight: "85vh",
-    objectFit: "contain",
-    borderRadius: 8,
-    cursor: "default",
-  },
-  lightboxCloseBtn: {
+  lightboxClose: {
     position: "absolute",
-    top: 18,
-    right: 20,
-    background: "rgba(255,255,255,0.15)",
+    top: 14,
+    right: 14,
+    background: "rgba(255,255,255,0.14)",
+    color: "#fff",
     border: "none",
-    color: "#fff",
-    fontSize: 26,
-    width: 40,
-    height: 40,
-    borderRadius: "50%",
-    lineHeight: "40px",
-  },
-  lightboxNavBtn: {
-    position: "absolute",
-    top: "50%",
-    transform: "translateY(-50%)",
-    background: "rgba(255,255,255,0.15)",
-    border: "none",
-    color: "#fff",
-    fontSize: 30,
-    width: 46,
-    height: 46,
-    borderRadius: "50%",
-    lineHeight: "44px",
-  },
-  lightboxCounter: {
-    position: "absolute",
-    bottom: 24,
-    left: "50%",
-    transform: "translateX(-50%)",
-    background: "rgba(255,255,255,0.15)",
-    color: "#fff",
-    fontSize: 13,
-    fontWeight: 600,
-    padding: "6px 14px",
     borderRadius: 999,
+    width: 38,
+    height: 38,
+    fontSize: 16,
+  },
+  footer: {
+    textAlign: "center",
+    fontSize: 12,
+    color: DIM,
+    padding: "30px 16px 10px",
   },
 };
-
-
