@@ -49,6 +49,9 @@ function waLink(phone, text) {
   const clean = (phone || "").replace(/\D/g, "");
   return `https://wa.me/${clean}?text=${encodeURIComponent(text)}`;
 }
+function normalizaTel(t) {
+  return (t || "").replace(/\D/g, "");
+}
 
 function comprimirImagen(file, maxWidth = 700, calidad = 0.7) {
   return new Promise((resolve, reject) => {
@@ -96,9 +99,11 @@ export default function MarketplaceZonaConurbada() {
   const [filtroCategoria, setFiltroCategoria] = useState("");
   const [filtroCiudad, setFiltroCiudad] = useState("");
 
-  // registro vendedor
+  // registro / acceso vendedor
   const [showRegistroVendedor, setShowRegistroVendedor] = useState(false);
-  const [nuevoVendedor, setNuevoVendedor] = useState({ nombre: "", whatsapp: "", ciudad: CIUDADES[0] });
+  const [modoVendedor, setModoVendedor] = useState("login"); // "login" | "registro"
+  const [nuevoVendedor, setNuevoVendedor] = useState({ nombre: "", whatsapp: "", ciudad: CIUDADES[0], password: "" });
+  const [loginVendedor, setLoginVendedor] = useState({ whatsapp: "", password: "" });
 
   // form producto
   const [productoForm, setProductoForm] = useState(null);
@@ -252,8 +257,28 @@ export default function MarketplaceZonaConurbada() {
   function registrarVendedor() {
     const nombre = nuevoVendedor.nombre.trim();
     const whatsapp = nuevoVendedor.whatsapp.trim();
+    const password = (nuevoVendedor.password || "").trim();
     if (!nombre || !whatsapp) {
       setError("Completa el nombre de tu tienda y tu WhatsApp.");
+      return;
+    }
+    const telNuevo = normalizaTel(whatsapp);
+    if (telNuevo.length < 10) {
+      setError("Escribe un WhatsApp válido de 10 dígitos.");
+      return;
+    }
+    if (password.length < 4) {
+      setError("Crea una contraseña de al menos 4 caracteres.");
+      return;
+    }
+    if (vendedores.some((v) => normalizaTel(v.whatsapp) === telNuevo)) {
+      setError("Ese WhatsApp ya tiene una tienda registrada. Usa 'Iniciar sesión'.");
+      setModoVendedor("login");
+      setLoginVendedor({ whatsapp, password: "" });
+      return;
+    }
+    if (vendedores.some((v) => (v.nombre || "").trim().toLowerCase() === nombre.toLowerCase())) {
+      setError("Ya existe una tienda con ese nombre. Elige otro.");
       return;
     }
     const id = uid();
@@ -261,6 +286,7 @@ export default function MarketplaceZonaConurbada() {
       id,
       nombre,
       whatsapp,
+      password,
       ciudad: nuevoVendedor.ciudad,
       activo: true,
       ultimoPago: hoyISO(),
@@ -271,10 +297,43 @@ export default function MarketplaceZonaConurbada() {
     persist(nextVendedores, productos);
     persistIdentidad({ tipo: "vendedor", vendedorId: id, nombre });
     setShowRegistroVendedor(false);
-    setNuevoVendedor({ nombre: "", whatsapp: "", ciudad: CIUDADES[0] });
+    setNuevoVendedor({ nombre: "", whatsapp: "", ciudad: CIUDADES[0], password: "" });
     setError("");
     setTab("vender");
     showToast(`✓ Tienda creada — sesión iniciada como ${nombre}`);
+  }
+
+  function hacerLoginVendedor() {
+    const tel = normalizaTel(loginVendedor.whatsapp);
+    const pass = (loginVendedor.password || "").trim();
+    if (!tel || !pass) {
+      setError("Escribe tu WhatsApp y tu contraseña.");
+      return;
+    }
+    const vendedor = vendedores.find((v) => normalizaTel(v.whatsapp) === tel);
+    if (!vendedor) {
+      setError("No encontramos una tienda con ese WhatsApp. ¿Quieres crear una?");
+      return;
+    }
+    if (vendedor.password) {
+      if (vendedor.password !== pass) {
+        setError("Contraseña incorrecta.");
+        return;
+      }
+    } else {
+      // Tienda creada antes de que existieran contraseñas:
+      // la contraseña que escriba ahora queda guardada como suya.
+      const next = vendedores.map((v) => (v.id === vendedor.id ? { ...v, password: pass } : v));
+      setVendedores(next);
+      persist(next, productos);
+      showToast("🔒 Contraseña guardada para tu tienda");
+    }
+    persistIdentidad({ tipo: "vendedor", vendedorId: vendedor.id, nombre: vendedor.nombre });
+    setShowRegistroVendedor(false);
+    setLoginVendedor({ whatsapp: "", password: "" });
+    setError("");
+    setTab("vender");
+    showToast(`✓ Bienvenido de vuelta, ${vendedor.nombre}`);
   }
 
   function cerrarSesionVendedor() {
@@ -524,7 +583,11 @@ export default function MarketplaceZonaConurbada() {
           <button
             onClick={() => {
               if (miVendedor) setTab("vender");
-              else setShowRegistroVendedor(true);
+              else {
+                setModoVendedor(vendedores.length ? "login" : "registro");
+                setError("");
+                setShowRegistroVendedor(true);
+              }
             }}
             style={{ ...styles.navBtn, ...(tab === "vender" ? styles.navBtnActive : {}) }}
           >
@@ -787,37 +850,85 @@ export default function MarketplaceZonaConurbada() {
         </section>
       )}
 
-      {/* ---------- MODAL REGISTRO VENDEDOR ---------- */}
+      {/* ---------- MODAL ACCESO / REGISTRO VENDEDOR ---------- */}
       {showRegistroVendedor && (
         <div style={styles.overlay} onClick={() => setShowRegistroVendedor(false)}>
           <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-            <h3 style={styles.modalTitle}>Crea tu tienda</h3>
-            <p style={styles.modalSub}>
-              Publica tus productos y recibe pedidos directo por WhatsApp. Primer mes de prueba incluido;
-              después {money(CUOTA_MENSUAL)}/mes.
-            </p>
-            <input
-              style={styles.input}
-              placeholder="Nombre de tu tienda o negocio"
-              value={nuevoVendedor.nombre}
-              onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, nombre: e.target.value })}
-            />
-            <input
-              style={styles.input}
-              placeholder="WhatsApp (10 dígitos)"
-              value={nuevoVendedor.whatsapp}
-              onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, whatsapp: e.target.value })}
-            />
-            <select
-              style={styles.input}
-              value={nuevoVendedor.ciudad}
-              onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, ciudad: e.target.value })}
-            >
-              {CIUDADES.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-            <button style={styles.btnPrimario} onClick={registrarVendedor}>Crear mi tienda</button>
+            <h3 style={styles.modalTitle}>Vendedores</h3>
+
+            <div style={styles.entregaRow}>
+              <button
+                style={{ ...styles.entregaBtn, ...(modoVendedor === "login" ? styles.entregaBtnActiva : {}) }}
+                onClick={() => { setModoVendedor("login"); setError(""); }}
+              >
+                Iniciar sesión
+              </button>
+              <button
+                style={{ ...styles.entregaBtn, ...(modoVendedor === "registro" ? styles.entregaBtnActiva : {}) }}
+                onClick={() => { setModoVendedor("registro"); setError(""); }}
+              >
+                Crear tienda nueva
+              </button>
+            </div>
+
+            {modoVendedor === "login" ? (
+              <>
+                <p style={styles.modalSub}>Entra a tu tienda con el WhatsApp con que la registraste.</p>
+                <input
+                  style={styles.input}
+                  placeholder="WhatsApp (10 dígitos)"
+                  value={loginVendedor.whatsapp}
+                  onChange={(e) => setLoginVendedor({ ...loginVendedor, whatsapp: e.target.value })}
+                />
+                <input
+                  style={styles.input}
+                  type="password"
+                  placeholder="Contraseña"
+                  value={loginVendedor.password}
+                  onChange={(e) => setLoginVendedor({ ...loginVendedor, password: e.target.value })}
+                  onKeyDown={(e) => e.key === "Enter" && hacerLoginVendedor()}
+                />
+                <button style={styles.btnPrimario} onClick={hacerLoginVendedor}>Entrar a mi tienda</button>
+              </>
+            ) : (
+              <>
+                <p style={styles.modalSub}>
+                  Publica tus productos y recibe pedidos directo por WhatsApp. Primer mes de prueba incluido;
+                  después {money(CUOTA_MENSUAL)}/mes.
+                </p>
+                <input
+                  style={styles.input}
+                  placeholder="Nombre de tu tienda o negocio"
+                  value={nuevoVendedor.nombre}
+                  onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, nombre: e.target.value })}
+                />
+                <input
+                  style={styles.input}
+                  placeholder="WhatsApp (10 dígitos)"
+                  value={nuevoVendedor.whatsapp}
+                  onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, whatsapp: e.target.value })}
+                />
+                <input
+                  style={styles.input}
+                  type="password"
+                  placeholder="Crea una contraseña (mín. 4 caracteres)"
+                  value={nuevoVendedor.password}
+                  onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, password: e.target.value })}
+                />
+                <select
+                  style={styles.input}
+                  value={nuevoVendedor.ciudad}
+                  onChange={(e) => setNuevoVendedor({ ...nuevoVendedor, ciudad: e.target.value })}
+                >
+                  {CIUDADES.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <button style={styles.btnPrimario} onClick={registrarVendedor}>Crear mi tienda</button>
+              </>
+            )}
+
+            {error && <div style={{ color: RED, fontSize: 13 }}>{error}</div>}
             <button style={styles.btnLink} onClick={() => setShowRegistroVendedor(false)}>Cancelar</button>
           </div>
         </div>
